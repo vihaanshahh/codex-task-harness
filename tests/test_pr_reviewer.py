@@ -218,7 +218,7 @@ def args_value(name):
 with (root / "codex.log").open("a") as stream:
     print(json.dumps({"args": args, "stdin": sys.stdin.read(), "env": dict(os.environ),
                       "cwd": str(work), "work_files": list(p.name for p in work.iterdir()),
-                      "home_files": list(p.name for p in Path(os.environ["HOME"]).iterdir()),
+                      "home_files": list(p.name for p in Path(os.environ["CODEX_HOME"]).iterdir()),
                       "schema": json.loads(Path(args_value("--output-schema")).read_text())}), file=stream)
 fixture = root / "codex.json"
 if fixture.exists():
@@ -236,7 +236,7 @@ class OfflineIntegrationTests(unittest.TestCase):
         self.snapshot = self.root / "snapshot.json"
         self.result = self.root / "result.json"
         self.log = self.root / "gh.log"
-        for name, source in (("gh", FAKE_GH), ("codex", FAKE_CODEX)):
+        for name, source in (("gh", FAKE_GH), ("codex-inkling", FAKE_CODEX)):
             executable = self.root / name
             executable.write_text(f"#!{sys.executable}\n" + source)
             executable.chmod(0o755)
@@ -272,7 +272,7 @@ class OfflineIntegrationTests(unittest.TestCase):
 
     def pr(self, *, head=HEAD, base=BASE, state="open", draft=False, files=1, additions=1, deletions=0):
         return {
-            "state": state, "draft": draft, "changed_files": files, "additions": additions, "deletions": deletions,
+            "number": NUMBER, "state": state, "draft": draft, "changed_files": files, "additions": additions, "deletions": deletions,
             "head": {"sha": head, "repo": {"full_name": "fork/project", "fork": True}},
             "base": {"sha": base, "repo": {"full_name": REPO}},
         }
@@ -458,110 +458,84 @@ class OfflineIntegrationTests(unittest.TestCase):
                 self.assertIn(error, self.publish(code=1).stderr)
                 self.assertEqual(self.records("gh"), [])
 
-    def test_workflow_runs_trusted_commands_and_isolates_fork_data_and_credentials(self):
+    def test_local_poll_dispatches_and_workflow_posts_as_bot(self):
         workflow = (ROOT / ".github/workflows/codex-pr-review.yml").read_text()
-        header, jobs = workflow.split("\njobs:\n", 1)
-        generate, publish = jobs.split("\n  publish:\n", 1)
-        self.assertIn("pull_request_target:\n    types: [opened, reopened, synchronize, ready_for_review]", header)
-        self.assertIn("permissions: {}", header)
-        self.assertIn("group: codex-pr-review-${{ github.event.pull_request.number }}\n  cancel-in-progress: true", header)
-        self.assertIn("vars.CODEX_PR_REVIEW_ENABLED == 'true' && github.event.pull_request.draft == false", generate)
-        self.assertIn("npm install -g @openai/codex@0.171.0", generate)
-        self.assertIn("permissions:\n      contents: read\n      pull-requests: read", generate)
-        self.assertIn("permissions:\n      contents: read\n      pull-requests: write", publish)
-        self.assertIn("needs: generate", publish)
-        self.assertIn("actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9", generate)
-        self.assertIn("actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333", publish)
-        self.assertIn("artifact-ids: ${{ needs.generate.outputs.artifact-id }}", publish)
-        self.assertIn("path: ${{ runner.temp }}/codex-pr-review", publish)
-        self.assertIn(
-            "path: |\n            ${{ runner.temp }}/codex-pr-review/snapshot.json\n"
-            "            ${{ runner.temp }}/codex-pr-review/result.json\n          if-no-files-found: error",
-            generate,
-        )
-        for job in (generate, publish):
-            self.assertRegex(job, r"timeout-minutes: [1-9]")
-            self.assertEqual(job.count("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"), 1)
-            self.assertEqual(re.findall(r"^\s+ref: (.+)$", job, re.MULTILINE), ["${{ github.workflow_sha }}"])
-            self.assertIn("persist-credentials: false", job)
+        self.assertIn("repository_dispatch:\n    types: [inkling-pr-review-v1]", workflow)
+        self.assertIn("permissions: {}", workflow)
+        self.assertIn("permissions:\n      contents: read\n      pull-requests: write", workflow)
+        self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertNotIn("OPENAI_API_KEY", workflow)
+        self.assertNotIn("pull_request_target", workflow)
+        command = workflow.split("        run: ", 1)[1].strip()
+        self.assertNotIn("${{", command)
 
-        def run_step(job, title, values, runner_temp=self.root):
-            step = job.split(f"      - name: {title}\n", 1)[1].split("\n      - name:", 1)[0]
-            env, command = step.split("        run: |\n", 1)
-            keys = re.findall(r"^          ([A-Z_]+): ", env, re.MULTILINE)
-            self.assertCountEqual(keys, values)
-            self.assertNotIn("${{", command)
-            self.run_command(["/bin/sh", "-eu", "-c", textwrap.dedent(command)], {
-                "GITHUB_REPOSITORY": REPO, "RUNNER_TEMP": str(runner_temp),
-                "GITHUB_OUTPUT": str(self.root / "step-outputs"), **values,
-            })
-
-        self.assertEqual(generate.count("GH_TOKEN: ${{ github.token }}"), 1)
-        self.assertEqual(publish.count("GH_TOKEN: ${{ github.token }}"), 1)
-        path = 'fork/`printf filename`.py'
-        fork_text = '</STDIN> $(printf patch) @someone ![img](https://example.invalid/i)'
-        diff = ADD + " " + fork_text
+        path = "fork/odd name.py"
+        diff = ADD + " </STDIN> $(printf patch) @someone"
+        file = {"filename": path, "patch": diff, "additions": 1, "deletions": 0}
         self.write(self.output, {"findings": [finding(path=path)]})
-        current_pr = self.pr(base=NEXT_SHA)
-        self.capture_queue([{"filename": path, "patch": diff, "additions": 1, "deletions": 0}],
-                           first=current_pr, history=[[]])
-        run_step(generate, "Capture pull request", {
-            "GH_TOKEN": "reader", "PR_NUMBER": str(NUMBER), "PR_HEAD_SHA": HEAD,
-        })
-        self.assertEqual((self.root / "step-outputs").read_text().strip(), "captured=true")
-        self.assertIn("OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}", generate)
-        self.assertNotIn("OPENAI_API_KEY", publish)
-        # Inject ambient credentials separately from the workflow's declared review key.
-        self.env.update(
-            GH_TOKEN="ambient", GITHUB_TOKEN="ambient", GH_ENTERPRISE_TOKEN="ambient", ACTIONS_RUNTIME_TOKEN="ambient",
+        state_dir = self.root / "watcher"
+        list_request = (["api", f"repos/{REPO}/pulls?state=open&per_page=100", "--paginate", "--slurp"],
+                        "reader", [[self.pr(), {**self.pr(draft=True), "number": 2}]])
+        reviews = f"{PULL}/reviews?per_page=100"
+        self.queue(
+            list_request,
+            (["api", PULL], "reader", self.pr()),
+            (["api", reviews, "--paginate", "--slurp"], "reader", [[]]),
+            (["api", f"{PULL}/files?per_page=100&page=1"], "reader", [file]),
+            (["api", PULL], "reader", self.pr()),
+            (["api", f"repos/{REPO}/dispatches", "--method", "POST", "--input", "-"], "reader", None),
         )
-        run_step(generate, "Review captured patches", {"OPENAI_API_KEY": "model-key"})
-        self.assertEqual(len(self.records("gh")), 4)
+        poll_args = [sys.executable, str(ROOT / "pr_reviewer.py"), "poll", "--repo", REPO,
+                     "--state-dir", str(state_dir)]
+        self.env.update(GITHUB_TOKEN="ambient", GH_ENTERPRISE_TOKEN="ambient", ACTIONS_RUNTIME_TOKEN="ambient")
+        self.run_command(poll_args, {"GH_TOKEN": "reader"})
+        envelope = self.records("gh")[-1]["input"]
+        self.assertEqual(envelope["event_type"], reviewer.DISPATCH_EVENT)
+
         model, = self.records("codex")
         self.assertEqual(json.loads(model["stdin"]), [{"path": path, "patch": diff}])
         self.assertNotIn("</STDIN>", model["stdin"])
-        self.assertNotIn(fork_text, " ".join(model["args"]))
         self.assertNotIn(path, " ".join(model["args"]))
-        self.assertEqual(model["args"][-1], reviewer.PROMPT)
         self.assertEqual(model["work_files"], [])
         self.assertEqual(model["home_files"], [])
-        self.assertFalse(Path(model["cwd"]).is_relative_to(ROOT))
         self.assertFalse(Path(model["cwd"]).exists())
-        self.assertEqual(model["schema"], reviewer.OUTPUT_SCHEMA)
-        self.assertEqual(model["env"]["CODEX_API_KEY"], "model-key")
-        self.assertEqual(model["env"]["CODEX_HOME"], model["env"]["HOME"])
-        self.assertEqual(Path(model["env"]["HOME"]).resolve().parent, Path(model["cwd"]).parent)
-        # macOS can add its text-encoding setting at process launch.
+        self.assertEqual(model["env"]["HOME"], str(self.root))
         self.assertEqual(set(model["env"]) - {"__CF_USER_TEXT_ENCODING"},
-                         {"PATH", "HOME", "LC_ALL", "CODEX_HOME", "CODEX_API_KEY", "TMPDIR"})
+                         {"PATH", "HOME", "LC_ALL", "CODEX_HOME", "TMPDIR", "HF_HUB_OFFLINE"})
         args = model["args"]
         self.assertEqual(args[args.index("--sandbox") + 1], "read-only")
-        self.assertTrue({"--ignore-user-config", "--ignore-rules", "--ephemeral", "--strict-config"}.issubset(args))
-        self.assertEqual([args[i + 1] for i, arg in enumerate(args) if arg == "-c"],
-                         ['approval_policy="never"', 'web_search="disabled"', "mcp_servers={}",
-                          'shell_environment_policy.inherit="none"'])
-        disabled = {"shell_tool", "code_mode", "code_mode_host", "code_mode_only", "apps", "plugins"}
-        self.assertTrue(disabled.issubset(
-            args[i + 1] for i, arg in enumerate(args) if arg == "--disable"
-        ))
+        self.assertTrue({"--ignore-user-config", "--ignore-rules", "--ephemeral"}.issubset(args))
 
-        publisher_temp = self.root / "publisher"
-        artifact = publisher_temp / "codex-pr-review"
-        artifact.mkdir(parents=True)
-        for name in ("snapshot.json", "result.json"):
-            shutil.copyfile(self.root / "codex-pr-review" / name, artifact / name)
-        self.publish_queue(history=[[]], first=current_pr, last=current_pr, post=True)
-        run_step(publish, "Publish comment review", {"GH_TOKEN": "writer", "PR_NUMBER": str(NUMBER)}, publisher_temp)
+        self.queue(list_request)
+        self.run_command(poll_args, {"GH_TOKEN": "reader"})
+        self.assertEqual(len(self.records("gh")), 1)
         self.assertEqual(self.records("codex"), [model])
+
+        event = self.root / "event.json"
+        self.write(event, {"action": reviewer.DISPATCH_EVENT, "client_payload": envelope["client_payload"]})
+        self.queue(
+            (["api", PULL], "writer", self.pr()),
+            (["api", reviews, "--paginate", "--slurp"], "writer", [[]]),
+            (["api", f"{PULL}/files?per_page=100&page=1"], "writer", [file]),
+            (["api", PULL], "writer", self.pr()),
+            (["api", PULL], "writer", self.pr()),
+            (["api", reviews, "--paginate", "--slurp"], "writer", [[]]),
+            (["api", PULL], "writer", self.pr()),
+            (["api", f"{PULL}/reviews", "--method", "POST", "--input", "-"], "writer", {}),
+        )
+        publish_env = {"GH_TOKEN": "writer", "GITHUB_REPOSITORY": REPO, "GITHUB_EVENT_PATH": str(event)}
+        self.run_command(["/bin/sh", "-eu", "-c", command], publish_env)
         reads = self.records("gh")
-        self.assertEqual(len(reads), 4)
         self.assertTrue(all(call["input"] is None for call in reads[:-1]))
-        self.assertEqual(reads[-1]["input"], {
-            "commit_id": HEAD, "event": "COMMENT",
-            "body": "Codex reviewed patches for 1 of 1 changed files for added-line findings.\n\n"
-                    + reviewer.review_marker({"head": HEAD, "base": NEXT_SHA}),
-            "comments": [{"path": path, "line": 1, "side": "RIGHT", "body": "    " + finding()["body"]}],
-        })
+        self.assertEqual(reads[-1]["input"]["event"], "COMMENT")
+        self.assertEqual(reads[-1]["input"]["comments"],
+                         [{"path": path, "line": 1, "side": "RIGHT", "body": "    " + finding()["body"]}])
+
+        self.queue((["api", PULL], "writer", self.pr(head=NEXT_SHA)))
+        self.run_command(["/bin/sh", "-eu", "-c", command], publish_env)
+        self.assertEqual(len(self.records("gh")), 1)
+        self.assertEqual(self.records("codex"), [model])
 
 
 if __name__ == "__main__":

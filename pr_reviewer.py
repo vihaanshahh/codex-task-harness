@@ -2,16 +2,19 @@
 """Capture, review, and publish GitHub pull requests using Codex CLI."""
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from typing import NamedTuple
 
 
@@ -29,6 +32,10 @@ MAX_BATCH_FINDINGS = 10
 MAX_FINDINGS = 20
 MAX_BODY_CHARS = 800
 BOT_LOGIN = "github-actions[bot]"
+DISPATCH_EVENT = "inkling-pr-review-v1"
+DISPATCH_LIMIT = 60_000
+RETRY_SECONDS = 900
+DEFAULT_PROMPT_BYTES = 12 * 1024
 CAPTURE_GAPS = ("patch absent", "patch incomplete", "patch over size limit", "capture budget")
 
 HUNK = re.compile(r"@@ -(\d{1,10})(?:,(\d{1,10}))? \+(\d{1,10})(?:,(\d{1,10}))? @@(?: .*)?", re.ASCII)
@@ -213,6 +220,8 @@ def github(endpoint, *, paginate=False, payload=None):
     except (OSError, subprocess.SubprocessError) as exc:
         method = "POST" if payload is not None else "GET"
         raise ReviewError(f"GitHub API {method} failed for {endpoint}") from exc
+    if payload is not None and not result.stdout.strip():
+        return None
     return decode_json(result.stdout, "GitHub")
 
 
@@ -411,12 +420,9 @@ def inert_markdown(value):
 
 
 def run_codex(batch):
-    executable = shutil.which("codex")
+    executable = shutil.which("codex-inkling")
     if executable is None:
-        raise ReviewError("Codex CLI not found")
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise ReviewError("OPENAI_API_KEY is required to run Codex")
+        raise ReviewError("codex-inkling is required for local review")
     executable = os.path.abspath(executable)
     with tempfile.TemporaryDirectory(prefix="codex-pr-review-") as temporary:
         root = Path(temporary)
@@ -427,7 +433,7 @@ def run_codex(batch):
         schema.write_text(encode_json(OUTPUT_SCHEMA), encoding="ascii")
         output = root / "result.json"
         env = {key: os.environ[key] for key in ("PATH", "LANG", "LC_ALL") if key in os.environ}
-        env.update(CODEX_API_KEY=api_key, HOME=str(home), CODEX_HOME=str(home), TMPDIR=str(scratch))
+        env.update(HOME=str(Path.home()), CODEX_HOME=str(home), TMPDIR=str(scratch), HF_HUB_OFFLINE="1")
         command = [
             executable, "exec", "--skip-git-repo-check", "--ephemeral", "--ignore-user-config",
             "--ignore-rules", "--strict-config", "--sandbox", "read-only", "--color", "never",
@@ -443,19 +449,33 @@ def run_codex(batch):
             command += ["--disable", feature]
         command.append(PROMPT)
         try:
-            subprocess.run(
-                command,
-                input=batch.data.encode("ascii"),
-                cwd=work,
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True,
-                timeout=180,
-            )
+            with subprocess.Popen(
+                command, cwd=work, env=env, stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+            ) as process:
+                try:
+                    process.communicate(batch.data.encode("ascii"), timeout=180)
+                except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                    try:
+                        os.killpg(process.pid, signal.SIGINT)
+                        process.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    raise
+                if process.returncode:
+                    raise ReviewError(f"Inkling execution failed (exit {process.returncode})")
         except (OSError, subprocess.SubprocessError) as exc:
-            raise ReviewError("Codex execution failed or timed out") from exc
-        return read_json(output, MAX_MODEL_BYTES, "Codex final answer")
+            raise ReviewError("Inkling execution failed or timed out") from exc
+        with output.open("rb") as handle:
+            raw = handle.read(MAX_MODEL_BYTES + 1)
+        if len(raw) > MAX_MODEL_BYTES:
+            raise ReviewError("Inkling final answer exceeds the size limit")
+        raw = raw.strip()
+        if raw.startswith(b"```") and raw.endswith(b"```"):
+            raw = raw.partition(b"\n")[2].rsplit(b"\n", 1)[0]
+        return decode_json(raw, "Inkling final answer")
 
 
 def snapshot_id(snapshot):
@@ -486,7 +506,7 @@ def review(snapshot, max_batches, max_prompt_bytes):
 def coverage_summary(metadata, coverage):
     reviewed = coverage["reviewed_files"]
     total = metadata["changed_files"]
-    parts = [f"Codex reviewed patches for {reviewed} of {total} changed files for added-line findings."]
+    parts = [f"Inkling reviewed patches for {reviewed} of {total} changed files for added-line findings."]
     for reason, paths in coverage["skipped"].items():
         previews = [path[:160] + ("…" if len(path) > 160 else "") for path in paths[:3]]
         names = "\n".join(inert_markdown(path) or "    (whitespace-only path)" for path in previews)
@@ -559,8 +579,10 @@ def already_reviewed(endpoint, marker):
     return False
 
 
-def publish(repo, number, snapshot, result, *, dry_run=False):
+def publish(repo, number, snapshot, result, *, dry_run=False, omitted=0):
     payload = build_payload(snapshot, result)
+    if omitted:
+        payload["body"] += f"\n\nThe relay limit omitted {omitted} additional finding(s)."
     metadata = snapshot["metadata"]
     if (metadata["repo"], metadata["pr"]) != (repo, number):
         raise ReviewError("Artifact does not match the requested repository and pull request")
@@ -580,7 +602,104 @@ def publish(repo, number, snapshot, result, *, dry_run=False):
         print(json.dumps(payload, ensure_ascii=True, indent=2))
     else:
         github(endpoint, payload=payload)
-        print("Published Codex comment review.")
+        print("Published Inkling comment review.")
+
+
+def send_review(repo, snapshot, result):
+    build_payload(snapshot, result)
+    metadata = snapshot["metadata"]
+    findings = []
+    seen = set()
+    for output in result["outputs"]:
+        entries = []
+        for item in output["findings"]:
+            anchor = item["path"], item["line"]
+            if anchor not in seen:
+                entries.append(item)
+                seen.add(anchor)
+        findings.append(entries)
+    payload = {key: result[key] for key in ("snapshot_id", "max_batches", "max_prompt_bytes")}
+    payload.update(number=metadata["pr"], head=metadata["head"], base=metadata["base"],
+                   outputs=[{"findings": entries} for entries in findings], omitted=0)
+    event = {"event_type": DISPATCH_EVENT, "client_payload": payload}
+    while len(encode_json(event)) > DISPATCH_LIMIT:
+        for entries in reversed(findings):
+            if entries:
+                entries.pop()
+                payload["omitted"] += 1
+                break
+        else:
+            raise ReviewError("Review metadata exceeds the dispatch limit")
+    github(f"repos/{repo}/dispatches", payload=event)
+
+
+def receive_review(repo, event):
+    if not isinstance(event, dict):
+        raise ReviewError("Invalid GitHub event")
+    data = event.get("client_payload")
+    if (
+        event.get("action") != DISPATCH_EVENT
+        or not object_keys(data, "number", "head", "base", "snapshot_id", "max_batches",
+                           "max_prompt_bytes", "outputs", "omitted")
+        or not valid_target(repo, data["number"])
+        or any(not isinstance(data[key], str) or not SHA.fullmatch(data[key]) for key in ("head", "base"))
+        or not integer(data["omitted"], 0, MAX_BATCHES * MAX_BATCH_FINDINGS)
+    ):
+        raise ReviewError("Invalid Inkling review event")
+    snapshot = capture(repo, data["number"], data["head"], data["base"], skip_reviewed=True)
+    if data["snapshot_id"] != snapshot_id(snapshot):
+        raise ReviewSkipped("GitHub's current patches differ from the captured snapshot")
+    _, coverage = plan_review(snapshot, data["max_batches"], data["max_prompt_bytes"])
+    result = {key: data[key] for key in ("snapshot_id", "max_batches", "max_prompt_bytes", "outputs")}
+    result.update(version=VERSION, coverage=coverage)
+    publish(repo, data["number"], snapshot, result, omitted=data["omitted"])
+
+
+def poll(repo, state_dir, *, dry_run=False):
+    if not valid_target(repo, 1):
+        raise ReviewError("Expected an owner/repository")
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (state_dir / "worker.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        ledger_path = state_dir / "dispatches.json"
+        ledger = read_json(ledger_path, MAX_RESULT_BYTES, "dispatch history") if ledger_path.exists() else {}
+        if not isinstance(ledger, dict):
+            raise ReviewError("Invalid dispatch history")
+        now = int(time.time())
+        ledger = {key: stamp for key, stamp in ledger.items()
+                  if integer(stamp) and 0 <= now - stamp < RETRY_SECONDS}
+        pages = github(f"repos/{repo}/pulls?state=open&per_page={PAGE_SIZE}", paginate=True)
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+            raise ReviewError("Invalid pull request list from GitHub")
+        errors = []
+        for page in pages:
+            for pr in page:
+                if pr.get("draft") is not False:
+                    continue
+                number = pr["number"]
+                try:
+                    head, base = pr["head"]["sha"], pr["base"]["sha"]
+                    key = f"{repo}/{number}/{head}/{base}"
+                    if key in ledger and not dry_run:
+                        continue
+                    snapshot = capture(repo, number, head, base, skip_reviewed=True)
+                    result = review(snapshot, 6, DEFAULT_PROMPT_BYTES)
+                    if dry_run:
+                        print(json.dumps(build_payload(snapshot, result), indent=2))
+                    else:
+                        send_review(repo, snapshot, result)
+                        ledger[key] = int(time.time())
+                        write_json(ledger_path, ledger, MAX_RESULT_BYTES)
+                        print(f"Dispatched Inkling review for #{number} at {head[:12]}", flush=True)
+                except ReviewSkipped:
+                    continue
+                except (ReviewError, OSError) as exc:
+                    errors.append(f"#{number}: {exc}")
+        if errors:
+            raise ReviewError("; ".join(errors))
 
 
 def main(argv=None):
@@ -590,6 +709,13 @@ def main(argv=None):
     capture_args = commands.add_parser("capture", help="Fetch the current PR metadata and patches")
     review_args = commands.add_parser("review", help="Run Codex on a captured snapshot")
     publish_args = commands.add_parser("publish", help="Validate and submit a GitHub COMMENT review")
+    poll_args = commands.add_parser("poll", help="Review open PRs locally and dispatch eligible results")
+    poll_args.add_argument("--repo", required=True)
+    poll_args.add_argument("--state-dir", type=Path, required=True)
+    poll_args.add_argument("--dry-run", action="store_true")
+    receive_args = commands.add_parser("receive", help="Validate a GitHub dispatch and post its bot review")
+    receive_args.add_argument("--repo", required=True)
+    receive_args.add_argument("--event", type=Path, required=True)
     for command in (capture_args, review_args, publish_args):
         command.add_argument("--snapshot", type=Path, required=True)
     for command in (capture_args, publish_args):
@@ -602,7 +728,7 @@ def main(argv=None):
         command.add_argument("--result", type=Path, required=True)
     review_args.add_argument("--max-batches", type=int, default=6, help=f"1 to {MAX_BATCHES}, default 6")
     review_args.add_argument(
-        "--max-prompt-bytes", type=int, default=32 * 1024, help=f"1 to {MAX_PROMPT_BYTES}, default 32768"
+        "--max-prompt-bytes", type=int, default=DEFAULT_PROMPT_BYTES, help=f"1 to {MAX_PROMPT_BYTES}, default {DEFAULT_PROMPT_BYTES}"
     )
     publish_args.add_argument("--dry-run", action="store_true", help="Print validated review JSON")
     args = parser.parse_args(argv)
@@ -610,7 +736,16 @@ def main(argv=None):
     try:
         if args.command in {"capture", "publish"} and not valid_target(args.repo, args.pr):
             raise ReviewError("Expected an owner/repository and a positive pull request number")
-        if args.command == "capture":
+        if args.command == "poll":
+            poll(args.repo, args.state_dir, dry_run=args.dry_run)
+        elif args.command == "receive":
+            if not valid_target(args.repo, 1):
+                raise ReviewError("Expected an owner/repository")
+            try:
+                receive_review(args.repo, read_json(args.event, 100_000, "GitHub event"))
+            except ReviewSkipped as exc:
+                print(f"Skipping review: {exc}")
+        elif args.command == "capture":
             snapshot = capture(
                 args.repo, args.pr, args.expected_head, args.expected_base,
                 skip_reviewed=args.skip_reviewed,

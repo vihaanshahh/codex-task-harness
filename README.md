@@ -53,6 +53,10 @@ Inspect the retained worktree and transcripts with `codex-task show JOB_ID`. Job
 
 After Ctrl-C, rerun `codex-task run` to continue from saved checkpoints. An interrupted step starts again and sees any partial changes in its worktree. After resolving a blocker, use `codex-task run --job JOB_ID --retry`. Completed checks and review are tied to the worktree content. The harness takes a local lock while a worker runs.
 
+## Automatic PR review
+
+Set the GitHub Actions repository variable `CODEX_PR_REVIEW_ENABLED` to `true` and add the repository secret `OPENAI_API_KEY`. Codex reviews bounded patches from open, non-draft pull requests and GitHub Actions posts a comment review with validated inline findings and a coverage summary. The [reviewer guide](docs/pr-reviewer.md) covers authentication, local dry runs, and review limits.
+
 ## Develop
 
 ```sh

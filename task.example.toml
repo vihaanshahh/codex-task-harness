@@ -1,0 +1,9 @@
+task = """
+Correct the date parser so invalid calendar dates return a clear error.
+Preserve existing valid inputs. Add a regression test for February 30.
+"""
+scope = ["src/date_parser.py", "tests/test_date_parser.py"]
+mode = "edit"
+checks = [["python3", "-m", "unittest", "discover", "-v"]]
+timeout_seconds = 900
+repair_attempts = 1

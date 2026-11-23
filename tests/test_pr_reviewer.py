@@ -170,6 +170,28 @@ class ReviewTests(unittest.TestCase):
         self.assertIn("![img]", comment["body"])
         self.assertIn("[link]", comment["body"])
 
+    def test_smaller_hunks_preserve_added_line_anchors(self):
+        captured = snapshot(file_record("src.py", MULTI, 3, 2))
+        batches, _ = reviewer.plan_review(captured, 1, reviewer.MAX_PROMPT_BYTES)
+        pieces = reviewer.split_batch(batches[0])
+        self.assertEqual(set().union(*(part.anchors["src.py"] for part in pieces)),
+                         batches[0].anchors["src.py"])
+        varied = [child for piece in pieces for child in reviewer.split_batch(piece)]
+        self.assertTrue(varied)
+        self.assertTrue(all(child.anchors["src.py"] <= batches[0].anchors["src.py"] for child in varied))
+
+    def test_model_budget_failure_splits_the_batch_and_combines_output(self):
+        captured = snapshot(file_record("first.py", ADD, 1, 0), file_record("second.py", ADD, 1, 0))
+        answers = [reviewer.RetryableReviewError("max_output_tokens"),
+                   {"findings": [finding(path="first.py")]},
+                   {"findings": [finding(path="second.py")]}]
+        with patch.object(reviewer, "run_codex", side_effect=answers) as call:
+            result = reviewer.review(captured, 1, reviewer.MAX_PROMPT_BYTES)
+        self.assertEqual(call.call_count, 3)
+        self.assertEqual([item["path"] for item in result["outputs"][0]["findings"]],
+                         ["first.py", "second.py"])
+        self.assertEqual(len(reviewer.build_payload(captured, result)["comments"]), 2)
+
     def test_no_reviewable_patches_does_not_claim_a_clean_review(self):
         captured = snapshot(file_record("delete.py", DELETE, 0, 1))
         with patch.object(reviewer, "run_codex") as model:
@@ -494,7 +516,7 @@ class OfflineIntegrationTests(unittest.TestCase):
         self.assertEqual(envelope["event_type"], reviewer.DISPATCH_EVENT)
 
         model, = self.records("codex")
-        self.assertEqual(json.loads(model["stdin"]), [{"path": path, "patch": diff}])
+        self.assertEqual(json.loads(model["stdin"]), [{"path": path, "patch": diff, "allowed_added_lines": [1]}])
         self.assertNotIn("</STDIN>", model["stdin"])
         self.assertNotIn(path, " ".join(model["args"]))
         self.assertEqual(model["work_files"], [])
@@ -502,7 +524,7 @@ class OfflineIntegrationTests(unittest.TestCase):
         self.assertFalse(Path(model["cwd"]).exists())
         self.assertEqual(model["env"]["HOME"], str(self.root))
         self.assertEqual(set(model["env"]) - {"__CF_USER_TEXT_ENCODING"},
-                         {"PATH", "HOME", "LC_ALL", "CODEX_HOME", "TMPDIR", "HF_HUB_OFFLINE"})
+                         {"PATH", "HOME", "LC_ALL", "CODEX_HOME", "TMPDIR", "HF_HUB_OFFLINE", "INKLING_REASONING_EFFORT", "INKLING_TEMPERATURE"})
         args = model["args"]
         self.assertEqual(args[args.index("--sandbox") + 1], "read-only")
         self.assertTrue({"--ignore-user-config", "--ignore-rules", "--ephemeral"}.issubset(args))

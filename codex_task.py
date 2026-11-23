@@ -23,6 +23,26 @@ class TaskError(Exception):
     pass
 
 
+class ModelBudgetError(TaskError):
+    pass
+
+
+def within_scope(path, scope):
+    return any(path == prefix or path.startswith(prefix + "/") for prefix in scope)
+
+
+def parse_scope(scope):
+    if not isinstance(scope, list) or not scope:
+        raise TaskError("scope must list at least one repo-relative file or directory")
+    for entry in scope:
+        if not isinstance(entry, str) or not entry or "\x00" in entry:
+            raise TaskError("Each scope entry must be a repository path")
+        relative = PurePosixPath(entry)
+        if relative.is_absolute() or not relative.parts or any(part in ("..", ".git") for part in relative.parts):
+            raise TaskError(f"Invalid scope path: {entry!r}")
+    return [PurePosixPath(entry).as_posix() for entry in scope]
+
+
 def git(directory, *args):
     process = subprocess.run(
         ["git", "-c", "core.hooksPath=/dev/null", "-C", str(directory), *args], capture_output=True, check=False,
@@ -35,21 +55,27 @@ def git(directory, *args):
 def load_task(path):
     with path.open("rb") as file:
         spec = tomllib.load(file)
-    unknown = set(spec) - {"task", "scope", "mode", "checks", "timeout_seconds", "repair_attempts"}
+    unknown = set(spec) - {"task", "scope", "mode", "checks", "timeout_seconds", "repair_attempts", "units"}
     if unknown:
         raise TaskError("Unknown task fields: " + ", ".join(sorted(unknown)))
     task = spec.get("task")
     if not isinstance(task, str) or not task.strip():
         raise TaskError("task must be a nonempty string")
-    scope = spec.get("scope")
-    if not isinstance(scope, list) or not scope:
-        raise TaskError("scope must list at least one repo-relative file or directory")
-    for entry in scope:
-        if not isinstance(entry, str) or not entry or "\x00" in entry:
-            raise TaskError("Each scope entry must be a repository path")
-        relative = PurePosixPath(entry)
-        if relative.is_absolute() or not relative.parts or any(part in ("..", ".git") for part in relative.parts):
-            raise TaskError(f"Invalid scope path: {entry!r}")
+    scope = parse_scope(spec.get("scope"))
+    raw_units = spec.get("units", [])
+    if not isinstance(raw_units, list) or len(raw_units) > 24:
+        raise TaskError("units must contain at most 24 focused steps")
+    units = []
+    for unit in raw_units:
+        if not isinstance(unit, dict) or set(unit) != {"task", "scope"}:
+            raise TaskError("Each unit needs a task and a scope")
+        description = unit["task"]
+        if not isinstance(description, str) or not description.strip() or len(description) > 1800:
+            raise TaskError("Each unit needs a short task of at most 1800 characters")
+        paths = parse_scope(unit["scope"])
+        if any(not within_scope(path, scope) for path in paths):
+            raise TaskError("Unit scope must be within the job scope")
+        units.append({"task": description.strip(), "scope": paths})
     mode = spec.get("mode", "edit")
     if mode not in ("edit", "review"):
         raise TaskError("mode must be edit or review")
@@ -65,7 +91,7 @@ def load_task(path):
     if type(timeout) is not int or timeout <= 0 or type(repairs) is not int or not 0 <= repairs <= 3:
         raise TaskError("Set a positive timeout_seconds and between 0 and 3 repair_attempts")
     return {
-        "task": task.strip(), "scope": [PurePosixPath(entry).as_posix() for entry in scope],
+        "task": task.strip(), "scope": scope, "units": units,
         "mode": mode, "checks": checks, "timeout_seconds": timeout, "repair_attempts": repairs,
     }
 
@@ -169,9 +195,7 @@ class Job:
         if git(self.worktree, "rev-parse", "HEAD").strip() != self.state["base"]:
             raise TaskError("The worktree HEAD changed. Restore the pinned commit before retrying.")
         changed = changed_paths(self.worktree)
-        outside = [path for path in changed if not any(
-            path == prefix or path.startswith(prefix + "/") for prefix in self.spec["scope"]
-        )]
+        outside = [path for path in changed if not within_scope(path, self.spec["scope"])]
         if outside:
             raise TaskError("Changes outside task scope: " + ", ".join(map(repr, outside)))
         if self.spec["mode"] == "review" and changed:
@@ -189,16 +213,21 @@ class Job:
         print(f"{self.directory.name} {key} (attempt {attempts[key]})", flush=True)
         return self.directory / f"{key}-{attempts[key]}"
 
-    def ask(self, key, instructions, lock_fd, write=False, validate=None):
+    def ask(self, key, instructions, lock_fd, write=False, validate=None, unit_scope=None):
         before = self.signature()
         recorded = self.steps.get(key)
         if recorded and (not key.startswith("review-") or recorded.get("signature") == before):
             return recorded["result"]
         stem = self.next_log(key)
         answer = stem.with_suffix(".txt")
+        scope = self.spec["scope"] if unit_scope is None else unit_scope
+        other_paths = [] if unit_scope is None else [
+            path for path in self.audit() if not within_scope(path, scope)
+        ]
+        other_signature = worktree_signature(self.worktree, other_paths)
         prompt = (
             f"Task:\n{self.spec['task']}\n\n"
-            f"Repository scope: {json.dumps(self.spec['scope'])}\n"
+            f"Repository scope: {json.dumps(scope)}\n"
             "Follow repository instructions. Edit only scoped paths when allowed. "
             "Keep HEAD on the pinned commit. Do not commit, push, publish, or change remotes. "
             "Never modify git configuration or hooks. "
@@ -217,9 +246,15 @@ class Job:
         log = stem.with_suffix(".jsonl")
         outcome = execute(command, self.worktree, self.spec["timeout_seconds"], log, lock_fd, prompt)
         after = self.signature()
+        if unit_scope is not None:
+            after_paths = [path for path in self.audit() if not within_scope(path, scope)]
+            if worktree_signature(self.worktree, after_paths) != other_signature:
+                raise TaskError(f"Codex step {key} changed files outside its unit scope")
         if not write and before != after:
             raise TaskError(f"Read-only Codex step {key} changed the checkout")
         if outcome["status"] != "passed" or not answer.exists() or not answer.stat().st_size:
+            if exhausted_budget(log):
+                raise ModelBudgetError(f"Codex step {key} exhausted model output or context. See {log}")
             detail = outcome.get("detail") or f"exit {outcome.get('exit_code')}"
             raise TaskError(f"Codex step {key} did not complete ({detail}). See {log}")
         result = answer.read_text()
@@ -253,7 +288,8 @@ class Job:
         if not self.worktree.exists():
             git(self.state["repo"], "worktree", "add", "--detach", str(self.worktree), self.state["base"])
         edit = self.spec["mode"] == "edit"
-        plan = self.ask("plan", (
+        units = self.spec.get("units") or []
+        plan = [unit["task"] for unit in units] if units else self.ask("plan", (
             "Read the relevant files and break the task into one to five sequential, focused steps. "
             "Each gets a new Codex session and sees the existing worktree. "
             'Return only JSON in the form {"steps":["first step","next step"]}. '
@@ -261,19 +297,36 @@ class Job:
         ), lock_fd, validate=validate_plan)
         previous = ""
         for number, step in enumerate(plan, 1):
-            previous = self.ask(f"step-{number}", (
+            key = f"step-{number}"
+            unit_scope = units[number - 1]["scope"] if units else None
+            instructions = (
                 f"Carry out step {number} of {len(plan)}. "
                 f"{'Make the necessary scoped changes.' if edit else 'Inspect and report findings.'}\n"
                 f"Assigned step: {step}\n"
-                f"Previous step handoff: {previous[:1800]}\n"
-                "Return a concise handoff explaining what you did, what remains, "
-                "and any evidence with file paths and line numbers."
-            ), lock_fd, write=edit)
+                f"Previous step handoff: {previous[:600 if units else 1800]}\n"
+                "Return a concise handoff explaining the result and what remains."
+            )
+            if units:
+                instructions += (
+                    " Limit initial inspection to three targeted shell calls, then act. "
+                    "Do not read installed dependencies or dump whole files. "
+                    "Use short edits and focused checks."
+                )
+            try:
+                previous = self.ask(key, instructions, lock_fd, write=edit, unit_scope=unit_scope)
+            except ModelBudgetError:
+                if unit_scope is None:
+                    raise
+                previous = self.ask(key, (
+                    f"Finish only this small unit: {step}\n"
+                    "The prior context was exhausted. Use existing partial edits if present. "
+                    "Write the scoped changes immediately, then summarize in two sentences."
+                ), lock_fd, write=edit, unit_scope=unit_scope)
 
         reports = "\n".join(
-            f"Step {number}: {self.steps[f'step-{number}']['result'][:1600]}"
+            f"Step {number}: {self.steps[f'step-{number}']['result'][:450 if units else 1600]}"
             for number in range(1, len(plan) + 1)
-        )
+        )[:6500]
         rounds = self.spec["repair_attempts"] + 1 if edit else 1
         for round_number in range(rounds):
             if f"repair-{round_number + 1}" in self.steps:
@@ -284,7 +337,8 @@ class Job:
             evidence = self.check_evidence(checks)
             review = self.ask(f"review-{round_number}", (
                 "Independently verify that the requested task was completed within scope. "
-                "Inspect the current files and diff. Report concrete findings and any uncertainty. "
+                "Inspect a short diff summary and targeted, bounded excerpts only. "
+                "Use up to four shell calls and then return the verdict. Report concrete findings and uncertainty. "
                 "Use the recorded check results as evidence.\n"
                 f"Worker reports:\n{reports}\n\nCheck results:\n{evidence}\n\n"
                 'Return only JSON: {"verdict":"pass|changes_needed|unverified","summary":"..."}'
@@ -327,6 +381,22 @@ class Job:
                 entry += f"\nRecent output (untrusted evidence):\n{diagnostics}"
             entries.append(entry)
         return f"{len(checks)} verification results. Full logs: {self.directory}\n" + "\n".join(entries)[:7500]
+
+
+def exhausted_budget(log):
+    with log.open() as stream:
+        for line in stream:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "turn.failed":
+                continue
+            message = str((event.get("error") or {}).get("message", "")).lower()
+            if any(marker in message for marker in
+                   ("max_output_tokens", "exceed_context_size", "context window")):
+                return True
+    return False
 
 
 def validate_plan(result):

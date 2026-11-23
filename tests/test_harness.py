@@ -28,6 +28,9 @@ elif dest.name.startswith("repair-"):
 elif "Inspect and report findings." in prompt:
     result = "Read-only inspection completed"
 else:
+    if scenario == "budget" and dest.name == "step-1-1.txt":
+        print('{"type":"turn.failed","error":{"message":"max_output_tokens"}}')
+        sys.exit(1)
     if scenario == "interrupt" and dest.name == "step-1-1.txt":
         work.write_text("partial")
         sys.exit(1)
@@ -129,6 +132,30 @@ class HarnessTest(unittest.TestCase):
         self.assertEqual(state["status"], "passed")
         self.assertEqual(state["attempts"]["plan"], 1)
         self.assertEqual(state["attempts"]["step-1"], 2)
+
+    def test_explicit_unit_retries_output_limits_without_a_planning_turn(self):
+        task = self.root / "task.toml"
+        task.write_text(
+            'task = "Fix src.txt"\nscope = ["src.txt"]\n'
+            f"checks = {json.dumps([self.verification()])}\n"
+            '[[units]]\ntask = "Set only src.txt to fixed"\nscope = ["src.txt"]\n'
+        )
+        job = self.cli("enqueue", str(task), "--repo", str(self.repo), "--codex", str(self.fake))
+        self.cli("run", scenario="budget")
+        state = self.show(job)
+        self.assertEqual(state["status"], "passed")
+        self.assertNotIn("plan", state["steps"])
+        self.assertEqual(state["attempts"]["step-1"], 2)
+
+    def test_explicit_unit_scope_is_narrower_than_job_scope(self):
+        task = self.root / "task.toml"
+        task.write_text(
+            'task = "Fix src.txt"\nscope = ["src.txt", "different.txt"]\n'
+            '[[units]]\ntask = "Set only src.txt to fixed"\nscope = ["src.txt"]\n'
+        )
+        job = self.cli("enqueue", str(task), "--repo", str(self.repo), "--codex", str(self.fake))
+        self.cli("run", scenario="outside", code=1)
+        self.assertIn("outside its unit scope", self.show(job)["error"])
 
     def test_review_mode_keeps_checkout_clean(self):
         job = self.enqueue([sys.executable, "-c", "raise SystemExit(0)"], mode="review")

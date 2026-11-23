@@ -37,6 +37,18 @@ codex-task show JOB_ID
 
 Enqueue several manifests before running to process them in order. Use `enqueue --repo /path/to/repo` to submit from another directory. `--base REF` pins a different local Git revision. `--codex codex-inkling` selects the existing Inkling launcher on a machine where it is separately installed. Use `mode = "review"` for a read-only inspection.
 
+For a local model, you can supply ordered `[[units]]` with smaller task and path scopes. Each unit starts a fresh session, skips the planning call, and gets one short retry after an output or context limit. Whole-job checks and independent review still run afterward.
+
+```toml
+[[units]]
+task = "Implement the date validity check in the parser."
+scope = ["src/date_parser.py"]
+
+[[units]]
+task = "Add a regression test for February 30."
+scope = ["tests/test_date_parser.py"]
+```
+
 Scope entries are literal repository-relative files or directories. Codex can read surrounding code. The harness checks tracked and non-ignored changes against the scope after each phase. It checks that read-only phases and verification commands preserve tracked and non-ignored file contents. Ignored build artifacts may be created. The selected repository and verification commands should be ones you trust. Verification commands run directly under your account with the supplied argument lists.
 
 ## What a job does

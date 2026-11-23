@@ -580,8 +580,14 @@ def split_batch(batch):
     return result
 
 
-def review_parts(batch, remaining):
+def review_parts(batch, remaining, checkpoint=None, checkpoint_path=None):
     pieces = split_batch(batch) if len(batch.data) > LEAF_BYTES else []
+    key = hashlib.sha256((LOCAL_PROMPT + "\n" + batch.data).encode("ascii")).hexdigest()
+    if not pieces and checkpoint is not None and key in checkpoint:
+        if checkpoint[key] is None:
+            pieces = split_batch(batch)
+        else:
+            return validate_findings(checkpoint[key], batch.anchors)
     if not pieces:
         if not remaining[0]:
             raise ReviewError("Local review call limit reached before all patches were reviewed")
@@ -592,22 +598,37 @@ def review_parts(batch, remaining):
             failure = error
         else:
             try:
-                return validate_findings(output, batch.anchors)
+                findings = validate_findings(output, batch.anchors)
             except ReviewError as error:
                 failure = error
+            else:
+                if checkpoint is not None:
+                    checkpoint[key] = output
+                    write_json(checkpoint_path, checkpoint, MAX_RESULT_BYTES)
+                return findings
         pieces = split_batch(batch)
         if not pieces:
             raise failure
-    return [finding for piece in pieces for finding in review_parts(piece, remaining)]
+        if checkpoint is not None:
+            checkpoint[key] = None
+            write_json(checkpoint_path, checkpoint, MAX_RESULT_BYTES)
+    return [finding for piece in pieces
+            for finding in review_parts(piece, remaining, checkpoint, checkpoint_path)]
 
 
-def review(snapshot, max_batches, max_prompt_bytes):
+def review(snapshot, max_batches, max_prompt_bytes, *, checkpoint_path=None):
     batches, coverage = plan_review(snapshot, max_batches, max_prompt_bytes)
+    checkpoint = None
+    if checkpoint_path is not None:
+        checkpoint = (read_json(checkpoint_path, MAX_RESULT_BYTES, "local review checkpoint")
+                      if checkpoint_path.exists() else {})
+        if not isinstance(checkpoint, dict):
+            raise ReviewError("Invalid local review checkpoint")
     outputs = []
     remaining = [MAX_LEAF_CALLS]
     for index, batch in enumerate(batches, 1):
         try:
-            findings = review_parts(batch, remaining)
+            findings = review_parts(batch, remaining, checkpoint, checkpoint_path)
         except ReviewError as exc:
             raise ReviewError(f"Review batch {index}/{len(batches)} failed: {exc}") from exc
         unique = {}
@@ -807,7 +828,8 @@ def poll(repo, state_dir, *, dry_run=False):
                     if key in ledger and not dry_run:
                         continue
                     snapshot = capture(repo, number, head, base, skip_reviewed=True)
-                    result = review(snapshot, 6, DEFAULT_PROMPT_BYTES)
+                    checkpoint_path = None if dry_run else state_dir / f"review-{number}-{snapshot_id(snapshot)}.json"
+                    result = review(snapshot, 6, DEFAULT_PROMPT_BYTES, checkpoint_path=checkpoint_path)
                     if dry_run:
                         print(json.dumps(build_payload(snapshot, result), indent=2))
                     else:

@@ -192,6 +192,21 @@ class ReviewTests(unittest.TestCase):
                          ["first.py", "second.py"])
         self.assertEqual(len(reviewer.build_payload(captured, result)["comments"]), 2)
 
+    def test_checkpoint_resumes_successful_parts_and_saved_split(self):
+        captured = snapshot(file_record("first.py", ADD, 1, 0), file_record("second.py", ADD, 1, 0))
+        with tempfile.TemporaryDirectory() as folder:
+            checkpoint = Path(folder) / "checkpoint.json"
+            answers = [reviewer.RetryableReviewError("max_output_tokens"),
+                       {"findings": [finding(path="first.py")]},
+                       reviewer.ReviewError("model is busy")]
+            with patch.object(reviewer, "run_codex", side_effect=answers):
+                with self.assertRaisesRegex(reviewer.ReviewError, "model is busy"):
+                    reviewer.review(captured, 1, reviewer.MAX_PROMPT_BYTES, checkpoint_path=checkpoint)
+            with patch.object(reviewer, "run_codex", return_value={"findings": [finding(path="second.py")]}) as call:
+                result = reviewer.review(captured, 1, reviewer.MAX_PROMPT_BYTES, checkpoint_path=checkpoint)
+            self.assertEqual(call.call_count, 1)
+        self.assertEqual(len(reviewer.build_payload(captured, result)["comments"]), 2)
+
     def test_no_reviewable_patches_does_not_claim_a_clean_review(self):
         captured = snapshot(file_record("delete.py", DELETE, 0, 1))
         with patch.object(reviewer, "run_codex") as model:
